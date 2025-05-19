@@ -1,0 +1,222 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+from shared_memory_dict import SharedMemoryDict
+import time
+
+smd_rvl = SharedMemoryDict(name='RVL', size=1024)
+smd_bzz = SharedMemoryDict(name='BZZ', size=1024)
+# smd_heart_beat = SharedMemoryDict(name='HEART_BEAT', size=1024)
+# tmp_heart_beat=False
+
+# def heart_beat(beat, delay_seconds, last_timer):
+# 	current_time = time.time()
+# 	if current_time - last_timer >= delay_seconds:
+# 		last_timer = current_time
+# 		# beat = not beat
+# 		beat = True
+# 		return beat, last_timer  # Return both updated values
+# 	return beat, last_timer
+
+##do not remove##
+# def ton_function(delay_seconds, last_timer):
+# 	current_time = time.time()
+# 	if current_time - last_timer >= delay_seconds:
+# 		last_timer = current_time
+# 		return True, last_timer
+# 	return False, last_timer
+#
+# def check_heart_beat(beat, last_timer):
+# 	if beat and  ton_function(10, last_timer):
+# 		return True, last_timer
+# 	elif not beat and  ton_function(6, last_timer):
+# 		return True, last_timer
+# 	return False, last_timer
+##do not remove##
+
+# # Polygon points for danger zones
+left_rect = np.array([[2, 10], [640, 10], [640, 630], [2, 630]], np.int32)
+right_rect = np.array([[640, 10], [1200, 10], [1200, 630], [640, 630]], np.int32)
+# left_rect = np.array([[10, 10], [350, 10], [350, 630], [10, 630]], np.int32)
+# right_rect = np.array([[355, 10], [630, 10], [630, 630], [355, 630]], np.int32)
+# left_rect = np.array([[5, 10], [220, 10], [220, 630], [5, 630]], np.int32)
+# right_rect = np.array([[225, 10], [500, 10], [500, 630], [225, 630]], np.int32)
+
+# Object detection class names
+classNames = ["forklift", "person"]
+
+
+def draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id):
+	"""Draw bounding boxes and details on the frame."""
+	cv2.rectangle(frame, (x1, y1), (x2, y2), (27, 225, 116), 2)
+	cv2.circle(frame, (cx, cy), 1, (255, 0, 0), 1)
+	cv2.putText(frame, f'{c}  {conf:.2f}', (x1, y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.putText(frame, f'{track_id}', (x2 - 100, y2 - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.putText(frame, 'DANGER', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+
+def gstreamer_pipeline(sensor_id=0, capture_width=1920, capture_height=1080, display_width=960, display_height=540,
+                       framerate=30, flip_method=0):
+	"""Generate GStreamer pipeline command for camera."""
+	return (
+			"nvarguscamerasrc sensor-id=%d ! "
+			"video/x-raw(memory:NVMM), width=(int)%d, height=(int)%d, framerate=(fraction)%d/1 ! "
+			"nvvidconv flip-method=%d ! "
+			"video/x-raw, width=(int)%d, height=(int)%d, format=(string)BGRx ! "
+			"videoconvert ! "
+			"video/x-raw, format=(string)BGR ! appsink"
+			% (sensor_id, capture_width, capture_height, framerate, flip_method, display_width, display_height)
+	)
+
+pipeline = " ! ".join(["v4l2src device=/dev/video0",
+                       "video/x-raw, width=640, height=480, framerate=30/1",
+                       "videoconvert",
+                       "video/x-raw, format=(string)BGR",
+                       "appsink"
+                       ])
+
+def initialize_model(yolo_model):
+	"""Load and configure YOLO model."""
+	model = YOLO(yolo_model)
+	# model = YOLO('/home/orin_nano/AIV/yolov8m_forklift_3.pt')
+	model.model.names = model.model.names  # Object class names
+	model.overrides['conf'] = 0.25  # NMS confidence threshold
+	model.overrides['iou'] = 0.55  # NMS IoU threshold
+	model.overrides['agnostic_nms'] = False  # NMS class-agnostic
+	model.overrides['max_det'] = 10  # Maximum detections per image
+	return model
+
+
+def process_frame(frame, model, left_rect, right_rect, names):
+	"""Process a single frame: detect objects and draw results."""
+	# frame = cv2.resize(frame, (640, 640))
+	results = model.track(frame, persist=True)
+	object_count_z1, object_count_z2 = 0, 0
+
+	# Check if there are any boxes in the results
+	if results[0].boxes is not None and results[0].boxes.id is not None:
+		boxes = results[0].boxes.xyxy.int().cpu().tolist()  # Bounding boxes
+		class_ids = results[0].boxes.cls.int().cpu().tolist()  # Class IDs
+		track_ids = results[0].boxes.id.int().cpu().tolist()  # Track IDs
+		confidences = results[0].boxes.conf.cpu().tolist()  # Confidence scores
+
+		for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, confidences):
+			if class_id == 0 and conf > 0.8:
+				c = names[class_id]
+				x1, y1, x2, y2 = box
+				cx, cy = int((x2 - x1) / 2) + x1, int((y2 - y1) / 2) + y1
+
+				if cv2.pointPolygonTest(left_rect, (cx, cy), False) >= 0:
+					object_count_z1 += 1
+					draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id)
+
+				if cv2.pointPolygonTest(right_rect, (cx, cy), False) >= 0:
+					object_count_z2 += 1
+					draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id)
+
+	return frame, object_count_z1, object_count_z2
+
+
+def process_video():
+	"""Main video processing loop."""
+	model = initialize_model('/home/orin_nano/AIV/yolov8m_forklift_3.pt')
+	model_2 = initialize_model('/home/orin_nano/AIV/yolo11l.pt')
+	names = model.model.names
+	names_2 = model_2.model.names
+
+	# model_2 = initialize_model('/home/orin_nano/AIV/yolov8m.pt')
+	# names_2 = model_2.model_name
+
+	cap = cv2.VideoCapture(gstreamer_pipeline(flip_method=2), cv2.CAP_GSTREAMER)
+	cap2 = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+
+	frame_count = 0
+	last_timer = time.time()
+	beat = False
+	first_beat = False
+	# is_beating = False
+	# Is_status = False
+	while cap.isOpened():
+
+		# if not first_beat:
+		# 	smd_heart_beat['HEART_BEAT'] = 'True'
+		# 	first_beat = True
+		# else :
+		# 	beat,last_timer = heart_beat(beat,60,last_timer)
+		# 	if beat:
+		# 		smd_heart_beat['HEART_BEAT'] = 'True'
+		# 	else:
+		# 		smd_heart_beat['HEART_BEAT'] = 'False'
+			# is_beating = True
+		# print(f'beating {is_beating}')
+		# is_status, last_timer = check_heart_beat(is_beating, last_timer)
+		# print(f'Status {is_status}')
+		ret, frame = cap.read()
+		ret , frame2 = cap2.read()
+		frame = cv2.resize(frame, (640,480))
+
+		frame = np.hstack((frame2, frame))
+
+
+		if not ret:
+			break
+		frame_count += 1
+		if frame_count % 2 != 0:
+			continue
+
+		# Draw danger zone polygons
+		cv2.polylines(frame, [left_rect], isClosed=True, color=(255, 0, 4), thickness=3)
+		cv2.polylines(frame, [right_rect], isClosed=True, color=(255, 0, 4), thickness=3)
+
+		# Process the frame
+		frame, object_count_z1_f, object_count_z2_f = process_frame(frame, model, left_rect, right_rect, names)
+		frame, object_count_z1_p, object_count_z2_p = process_frame(frame, model_2, left_rect, right_rect, names_2)
+
+		# if (object_count_z1_f >= 1 and object_count_z1_p >= 1) or (object_count_z2_f >= 1 and object_count_z2_p  >= 1) or (object_count_z1_f >= 1 and object_count_z2_p >= 1) or (object_count_z1_p >= 1 and object_count_z2_f  >= 1):
+		if object_count_z1_f >= 1 or object_count_z2_f  >= 1:
+			
+			smd_rvl['RVL'] = 'RVL_ON'
+			smd_bzz['BZZ'] = 'BZZ_ON'
+
+		# elif object_count_z1_f >= 1 or object_count_z2_f >= 1 or object_count_z1_p >= 1 or object_count_z2_p >= 1:
+		elif object_count_z1_p >= 1 or object_count_z2_p >= 1:
+			smd_rvl['RVL'] = 'RVL_ON'
+			smd_bzz['BZZ'] = 'BZZ_OFF'
+
+		elif object_count_z1_f == 0 and object_count_z2_f == 0 and object_count_z1_p == 0 and object_count_z2_p == 0:
+			smd_rvl['RVL'] = 'RVL_OFF'
+			smd_bzz['BZZ'] = 'BZZ_OFF'
+
+
+
+		# Update frame with danger zone info
+		object_count_z1 = object_count_z1_p + object_count_z1_f
+		object_count_z2 = object_count_z2_p + object_count_z2_f
+		cv2.putText(frame, f'People: Z1-{object_count_z1_p} Z2-{object_count_z2_p}', (10, 30),
+			  cv2.FONT_HERSHEY_SIMPLEX,
+			  0.5, (0, 0, 255), 1)
+		cv2.putText(frame, f'Forklift: Z1-{object_count_z1_f} Z2-{object_count_z2_f}', (400, 30),
+			  cv2.FONT_HERSHEY_SIMPLEX,
+			  0.5, (0, 0, 255), 1)
+
+
+		# Display the processed frame
+		cv2.imshow('YOLO Real-Time Forklift Detection Alarm', frame)
+		if cv2.waitKey(1) & 0xFF == 27:
+			smd_rvl.clear()
+			smd_bzz.clear()
+			# smd_heart_beat.clear()
+			break
+
+
+	cap.release()
+	cv2.destroyAllWindows()
+
+
+# Entry point
+if __name__ == "__main__":
+	# smd_rvl.clear()
+	# smd_bzz.clear()
+	# heartbeat_thread = threading.Thread(target=heart_beat, daemon=True)
+	# heartbeat_thread.start()
+	process_video()
