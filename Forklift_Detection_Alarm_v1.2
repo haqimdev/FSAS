@@ -1,0 +1,240 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+from shared_memory_dict import SharedMemoryDict
+import tkinter as tk
+import sys
+import threading
+# import time
+
+smd_rvl = SharedMemoryDict(name='RVL', size=1024)
+smd_bzz = SharedMemoryDict(name='BZZ', size=1024)
+
+# # Polygon points for danger zones
+left_rect = np.array([[2, 10], [1200, 10], [1200, 480], [2, 480]], np.int32)
+right_rect = np.array([[0, 0], [0, 0], [0, 0], [0, 0]], np.int32)
+
+# Object detection class names
+classNames = ["forklift", "person"]
+
+class RedirectPrint:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+
+    def write(self, message):
+        # Insert the message into the Text widget
+        self.text_widget.insert("end", message)
+        self.text_widget.see("end")  # Scroll to the end of the Text widget
+
+    def flush(self):
+        pass  # Required for compatibility with sys.stdout
+
+
+class RedirectError:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+
+    def write(self, message):
+        # Highlight error messages in red
+        self.text_widget.insert("end", message, "error")
+        self.text_widget.see("end")  # Scroll to the end of the Text widget
+
+    def flush(self):
+        pass  # Required for compatibility with sys.stderr
+
+
+
+def create_gui():
+    # Create the main tkinter window
+    root = tk.Tk()
+    root.title("Program Output")
+    root.geometry("600x400")
+
+    # Create a Text widget to display logs
+    text_widget = tk.Text(root, wrap="word", font=("Arial", 10))
+    text_widget.pack(expand=True, fill="both")
+
+    # Add a tag for error messages
+    text_widget.tag_config("error", foreground="red")
+
+    # Redirect print statements to the Text widget
+    sys.stdout = RedirectPrint(text_widget)
+    sys.stderr = RedirectError(text_widget)
+
+    return root
+
+def draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id):
+	"""Draw bounding boxes and details on the frame."""
+	cv2.rectangle(frame, (x1, y1), (x2, y2), (27, 225, 116), 2)
+	# cv2.circle(frame, (cx, cy), 1, (255, 0, 0), 1)
+	cv2.putText(frame, f'{c}  {conf:.2f}', (x1, y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.putText(frame, f'{track_id}', (x2 - 100, y2 - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	# cv2.putText(frame, 'DANGER', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+
+pipeline = " ! ".join(["v4l2src device=/dev/video0",
+					"video/x-raw, width=640, height=480, framerate=30/1",
+					"videoconvert",
+					"video/x-raw, format=(string)BGR",
+					"appsink"	
+					])
+
+pipeline2 = " ! ".join(["v4l2src device=/dev/video2",
+					"video/x-raw, width=640, height=480, framerate=30/1",
+					"videoconvert",
+					"video/x-raw, format=(string)BGR",
+					"appsink"	
+					])
+
+def initialize_model(yolo_model):
+	"""Load and configure YOLO model."""
+	model = YOLO(yolo_model)
+	# model = YOLO('/home/orin_nano/AIV/yolov8m_forklift_3.pt')
+	model.model.names = model.model.names  # Object class names
+	model.overrides['conf'] = 0.25  # NMS confidence threshold
+	model.overrides['iou'] = 0.55  # NMS IoU threshold
+	model.overrides['agnostic_nms'] = False  # NMS class-agnostic
+	model.overrides['max_det'] = 10  # Maximum detections per image
+	return model
+
+
+def process_frame(frame, model, left_rect, right_rect, names):
+	"""Process a single frame: detect objects and draw results."""
+	# frame = cv2.resize(frame, (640, 640))
+	results = model.track(frame, persist=True)
+	object_count_z1, object_count_z2 = 0, 0
+
+	# Check if there are any boxes in the results
+	if results[0].boxes is not None and results[0].boxes.id is not None:
+		boxes = results[0].boxes.xyxy.int().cpu().tolist()  # Bounding boxes
+		class_ids = results[0].boxes.cls.int().cpu().tolist()  # Class IDs
+		track_ids = results[0].boxes.id.int().cpu().tolist()  # Track IDs
+		confidences = results[0].boxes.conf.cpu().tolist()  # Confidence scores
+
+		for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, confidences):
+			if class_id == 0 and conf > 0.8:
+				c = names[class_id]
+				x1, y1, x2, y2 = box
+				cx, cy = int((x2 - x1) / 2) + x1, int((y2 - y1) / 2) + y1
+
+				if cv2.pointPolygonTest(left_rect, (cx, cy), False) >= 0:
+					object_count_z1 += 1
+					draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id)
+
+	return frame, object_count_z1, object_count_z2
+
+
+def process_video():
+	"""Main video processing loop."""
+	try:
+		model = initialize_model('/home/orin_nano/AIV/yolov8m_forklift_3.pt')
+		model_2 = initialize_model('/home/orin_nano/AIV/yolo11l.pt')
+	except Exception as e:
+		print("Error initializing models:", e)
+		return
+	names = model.model.names
+	names_2 = model_2.model.names
+
+	try:
+		cap = cv2.VideoCapture(pipeline, cv2.CAP_GSTREAMER)
+		cap2 = cv2.VideoCapture(pipeline2, cv2.CAP_GSTREAMER)
+		if not cap.isOpened():
+			print("[WARN] OpenCV failed to open video capture for pipeline.")
+		if not cap2.isOpened():
+			print("[WARN] OpenCV failed to open video capture for pipeline2.")
+	except Exception as e:
+		print(f"Exiting due to error:{e}")
+		return
+
+	frame_count = 0
+	while cap.isOpened():
+		# try:
+		try: 
+			ret, frame = cap.read()
+		except Exception as e:
+			print(f"Error reading frame from pipeline: {e}")
+			break
+		try:
+			ret , frame2 = cap2.read()
+		except Exception as e:
+			print(f"Error reading frame from pipeline2: {e}")
+			break
+		try: 
+			frame = np.hstack((frame2, frame))
+		except Exception as e:
+			print(f"Error stacking frames: {e}")
+			break
+
+		frame_count += 1
+		if frame_count % 2 != 0:
+			continue
+
+		# Process the frame
+		try:
+			frame, object_count_z1_f, object_count_z2_f = process_frame(frame, model, left_rect, right_rect, names)
+		except Exception as e:
+			print(f"Error processing frame with model: {e}")
+			break
+		try: 
+			frame, object_count_z1_p, object_count_z2_p = process_frame(frame, model_2, left_rect, right_rect, names_2)
+		except Exception as e:
+			print(f"Error processing frame with model_2: {e}")
+			break
+		
+		try : 
+			if (object_count_z1_f >= 1 and object_count_z1_p >= 1) or (object_count_z2_f >= 1 and object_count_z2_p  >= 1) or (object_count_z1_f >= 1 and object_count_z2_p >= 1) or (object_count_z1_p >= 1 and object_count_z2_f  >= 1):
+				if object_count_z1_f >= 1:
+					
+					smd_rvl['RVL'] = 'RVL_ON'
+					smd_bzz['BZZ'] = 'BZZ_ON'
+
+				# elif object_count_z1_f >= 1 or object_count_z2_f >= 1 or object_count_z1_p >= 1 or object_count_z2_p >= 1:
+				elif object_count_z1_p >= 1:
+					smd_rvl['RVL'] = 'RVL_ON'
+					smd_bzz['BZZ'] = 'BZZ_OFF'
+
+				elif object_count_z1_f == 0 and object_count_z1_p == 0:
+					smd_rvl['RVL'] = 'RVL_OFF'
+					smd_bzz['BZZ'] = 'BZZ_OFF'
+		except Exception as e:
+			print(f"Error updating shared memory: {e}")
+			break
+
+
+
+		# Update frame with danger zone info
+		cv2.putText(frame, f'People: {object_count_z1_p} Forklift: {object_count_z1_f}', (10, 30),
+			cv2.FONT_HERSHEY_SIMPLEX,
+			0.5, (0, 0, 255), 1)
+
+		# Display the processed frame
+		# cv2.imshow('YOLO Real-Time Forklift Detection Alarm', frame)
+		if cv2.waitKey(1) & 0xFF == 27:
+			smd_rvl.clear()
+			smd_bzz.clear()
+			# smd_heart_beat.clear()
+			break
+		# except Exception as e:
+		# 	# log_message(f"Error processing frame: {e}")
+		# 	print(f"Exiting due to error:{e}")
+		# 	print(traceback.format_exc())
+		# 	# tkinter.messagebox.showerror('Error',traceback.format_exc())
+		# 	break
+
+
+	cap.release()
+	cv2.destroyAllWindows()
+
+
+# Entry point
+if __name__ == "__main__":
+	root = create_gui()
+
+	# Example print statements
+	print("Starting the program...")
+	video_thread = threading.Thread(target=process_video)
+	video_thread.start()
+	# Run the tkinter event loop
+	root.mainloop()
+
+
