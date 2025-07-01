@@ -182,20 +182,20 @@ def process_video():
 			break
 		
 		try : 
-			if (object_count_z1_f >= 1 and object_count_z1_p >= 1) or (object_count_z2_f >= 1 and object_count_z2_p  >= 1) or (object_count_z1_f >= 1 and object_count_z2_p >= 1) or (object_count_z1_p >= 1 and object_count_z2_f  >= 1):
-				if object_count_z1_f >= 1:
-					
-					smd_rvl['RVL'] = 'RVL_ON'
-					smd_bzz['BZZ'] = 'BZZ_ON'
 
-				# elif object_count_z1_f >= 1 or object_count_z2_f >= 1 or object_count_z1_p >= 1 or object_count_z2_p >= 1:
-				elif object_count_z1_p >= 1:
-					smd_rvl['RVL'] = 'RVL_ON'
-					smd_bzz['BZZ'] = 'BZZ_OFF'
-
-				elif object_count_z1_f == 0 and object_count_z1_p == 0:
-					smd_rvl['RVL'] = 'RVL_OFF'
-					smd_bzz['BZZ'] = 'BZZ_OFF'
+			if object_count_z1_f >= 1:
+				
+				smd_rvl['RVL'] = 'RVL_ON'
+				smd_bzz['BZZ'] = 'BZZ_ON'
+	
+			# elif object_count_z1_f >= 1 or object_count_z2_f >= 1 or object_count_z1_p >= 1 or object_count_z2_p >= 1:
+			elif object_count_z1_p >= 1:
+				smd_rvl['RVL'] = 'RVL_ON'
+				smd_bzz['BZZ'] = 'BZZ_OFF'
+	
+			elif object_count_z1_f == 0 and object_count_z1_p == 0:
+				smd_rvl['RVL'] = 'RVL_OFF'
+				smd_bzz['BZZ'] = 'BZZ_OFF'
 		except Exception as e:
 			print(f"Error updating shared memory: {e}")
 			break
