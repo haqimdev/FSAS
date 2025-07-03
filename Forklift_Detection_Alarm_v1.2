@@ -20,11 +20,15 @@ classNames = ["forklift", "person"]
 class RedirectPrint:
     def __init__(self, text_widget):
         self.text_widget = text_widget
+        self.max_lines = 50  # Limit to 100 lines
 
     def write(self, message):
-        # Insert the message into the Text widget
         self.text_widget.insert("end", message)
-        self.text_widget.see("end")  # Scroll to the end of the Text widget
+        self.text_widget.see("end")
+        # Limit the number of lines
+        lines = int(self.text_widget.index('end-1c').split('.')[0])
+        if lines > self.max_lines:
+            self.text_widget.delete("1.0", f"{lines - self.max_lines + 1}.0")
 
     def flush(self):
         pass  # Required for compatibility with sys.stdout
@@ -63,12 +67,15 @@ def create_gui():
 
     return root
 
-def draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id):
+def draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id,area_th):
 	"""Draw bounding boxes and details on the frame."""
 	cv2.rectangle(frame, (x1, y1), (x2, y2), (27, 225, 116), 2)
-	# cv2.circle(frame, (cx, cy), 1, (255, 0, 0), 1)
-	cv2.putText(frame, f'{c}  {conf:.2f}', (x1, y1 + 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
-	cv2.putText(frame, f'{track_id}', (x2 - 100, y2 - 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.circle(frame, (cx, cy), 5, (255, 0, 0), 2)
+	# cv2.putText(frame, f'{c}', (x1, y1+5), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.putText(frame, f'{conf:.2f}', (x1, y1+30), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	# cv2.putText(frame, f'{track_id}', (x1, y2-10), cv2.FONT_HERSHEY_SIMPLEX, 1, (22, 208, 71), 2)
+	cv2.putText(frame, f'{area_th}', (x1 , y1 + 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+	print(f" Object: {c} ID:{track_id} confidence:{conf:.2f} area:{area_th}")
 	# cv2.putText(frame, 'DANGER', (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
 
@@ -98,7 +105,7 @@ def initialize_model(yolo_model):
 	return model
 
 
-def process_frame(frame, model, left_rect, right_rect, names):
+def process_frame(frame, model, left_rect, right_rect, names, confidence_threshold, area_threshold):
 	"""Process a single frame: detect objects and draw results."""
 	# frame = cv2.resize(frame, (640, 640))
 	results = model.track(frame, persist=True)
@@ -112,14 +119,15 @@ def process_frame(frame, model, left_rect, right_rect, names):
 		confidences = results[0].boxes.conf.cpu().tolist()  # Confidence scores
 
 		for box, class_id, track_id, conf in zip(boxes, class_ids, track_ids, confidences):
-			if class_id == 0 and conf > 0.8:
+			x1, y1, x2, y2 = box
+			area_box = (x2 - x1) * (y2 - y1)
+			if class_id == 0 and conf > confidence_threshold and area_box > area_threshold: 
 				c = names[class_id]
-				x1, y1, x2, y2 = box
-				cx, cy = int((x2 - x1) / 2) + x1, int((y2 - y1) / 2) + y1
+				cx, cy = int((x2 -x1) / 2) + x1, int((y2-y1) / 2) + y1
 
 				if cv2.pointPolygonTest(left_rect, (cx, cy), False) >= 0:
 					object_count_z1 += 1
-					draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id)
+					draw_detections(frame, x1, y1, x2, y2, cx, cy, c, conf, track_id,area_box)
 
 	return frame, object_count_z1, object_count_z2
 
@@ -171,28 +179,24 @@ def process_video():
 
 		# Process the frame
 		try:
-			frame, object_count_z1_f, object_count_z2_f = process_frame(frame, model, left_rect, right_rect, names)
+			frame, object_count_z1_f, object_count_z2_f = process_frame(frame, model, left_rect, right_rect, names, 0.7, 10000)
 		except Exception as e:
 			print(f"Error processing frame with model: {e}")
 			break
 		try: 
-			frame, object_count_z1_p, object_count_z2_p = process_frame(frame, model_2, left_rect, right_rect, names_2)
+			frame, object_count_z1_p, object_count_z2_p = process_frame(frame, model_2, left_rect, right_rect, names_2, 0.3, 3000)
 		except Exception as e:
 			print(f"Error processing frame with model_2: {e}")
 			break
-		
-		try : 
-
+		try: 
 			if object_count_z1_f >= 1:
-				
 				smd_rvl['RVL'] = 'RVL_ON'
 				smd_bzz['BZZ'] = 'BZZ_ON'
-	
-			# elif object_count_z1_f >= 1 or object_count_z2_f >= 1 or object_count_z1_p >= 1 or object_count_z2_p >= 1:
+
 			elif object_count_z1_p >= 1:
 				smd_rvl['RVL'] = 'RVL_ON'
 				smd_bzz['BZZ'] = 'BZZ_OFF'
-	
+
 			elif object_count_z1_f == 0 and object_count_z1_p == 0:
 				smd_rvl['RVL'] = 'RVL_OFF'
 				smd_bzz['BZZ'] = 'BZZ_OFF'
@@ -208,7 +212,7 @@ def process_video():
 			0.5, (0, 0, 255), 1)
 
 		# Display the processed frame
-		# cv2.imshow('YOLO Real-Time Forklift Detection Alarm', frame)
+		cv2.imshow('YOLO Real-Time Forklift Detection Alarm', frame)
 		if cv2.waitKey(1) & 0xFF == 27:
 			smd_rvl.clear()
 			smd_bzz.clear()
